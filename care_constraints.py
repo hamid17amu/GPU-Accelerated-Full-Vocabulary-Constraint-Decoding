@@ -335,14 +335,37 @@ class RowFilter:
         import time
         t0 = time.perf_counter()
         text = self.text_of(gen_ids)
+
+        # Scan the text to find the current grammatical state
+        sites = extract_sites(text, final=False)
+        pending_site = None
+        for kind, recv, name, complete in sites:
+            if not complete:
+                pending_site = (kind, recv, name)
+                break  # This is the incomplete name we are currently typing
+
         out = []
         for i in cand_ids:
+            piece = self.pieces[i]
+
             if i in self.stop_ids:
                 ok = self.c.check(text, final=True)
-            elif self.pieces[i] is None:
+            elif piece is None:
                 ok = True                # other special tokens: fail open
             else:
-                ok = self.c.check(text + self.pieces[i])
+                # If we have an incomplete site, just check if the piece forms a valid prefix
+                if pending_site:
+                    kind, recv, base_name = pending_site
+                    dom = self.c._domain(kind, recv)
+                    
+                    if dom is None:
+                        ok = True        # unresolved site: fail open
+                    else:
+                        new_name = base_name + piece
+                        ok = any(c.startswith(new_name) for c in dom)
+                else:
+                    # If no pending name, fall back to checking if the token introduces a new site
+                    ok = self.c.check(text + piece)
             if ok:
                 out.append(i)
         self.checked += len(cand_ids)
