@@ -1,4 +1,4 @@
-# GPU-Accelerated Full-Vocabulary Constraint Decoding — starter code
+# GPU-Accelerated Full-Vocabulary Constraint Decoding
 
 Starter code for the project described in `GPU_Project_pirapu.pdf`.
 
