@@ -29,7 +29,10 @@ import re
 import subprocess
 from pathlib import Path
 
+import numpy as np
+
 from token_table import TokenTable
+from vectorizedTrieWalker import VectorizedTrieWalker
 
 IDENT = r"[A-Za-z_$][\w$]*"
 _IDENT_CHAR = re.compile(r"[\w$]")
@@ -331,12 +334,22 @@ class RowFilter:
         self.seconds = 0.0               # time spent inside allowed()
         self.token_table = TokenTable(pieces)
 
+        # Extract all known domains from the constraints (e.g., {"Math": ["max", "min"...]})
+        # and initialize the vectorized walker once.
+        self.walker = VectorizedTrieWalker(
+            domains=self.c.get_all_domains(), 
+            vocab_identifiers=self.token_table.ident
+        )
+        
+        # Pass the structural flags to the walker for fast masking
+        self.walker.has_ws = np.array(self.token_table.has_ws, dtype=bool)
+        self.walker.has_rest = np.array([bool(r) for r in self.token_table.rest], dtype=bool)
+        self.walker.is_special = np.array(self.token_table.is_special, dtype=bool)
+
     def text_of(self, gen_ids):
         return "".join(self.pieces[i] or "" for i in gen_ids)
 
     def allowed(self, gen_ids, cand_ids):
-        import time
-        t0 = time.perf_counter()
         text = self.text_of(gen_ids)
 
         # Scan the text to find the current grammatical state
@@ -348,43 +361,26 @@ class RowFilter:
                 break  # This is the incomplete name we are currently typing
 
         out = []
-        for i in cand_ids:
-            if self.token_table.is_special[i]:
-                if i in self.stop_ids:
-                    ok = self.c.check(text, final=True)
-                else:
-                    out.append(i) # Fail open for other specials
-                continue               # other special tokens: fail open
-            if pending_site:
-                kind, recv, base_name = pending_site
-                dom = self.c._domain(kind, recv)
-                
-                if dom is None:
+        cand_array = np.array(cand_ids, dtype=np.int64)
+        if pending_site:
+            kind, recv, base_name = pending_site
+            
+            # Get the vectorized boolean mask for the entire vocabulary
+            valid_mask = self.walker.get_mask(recv, base_name)
+            
+            # Filter the candidates using NumPy
+            # We also fail-open for special tokens (like EOS) if they are in cand_ids
+            is_valid_cand = valid_mask[cand_array] | self.walker.is_special[cand_array]
+            
+            # Extract the actual token IDs that passed the check
+            out = cand_array[is_valid_cand].tolist()
+            
+        else:
+            # Fallback for complex tokens or new sites
+            for i in cand_ids:
+                if self.walker.is_special[i]:
                     out.append(i)
-                    continue
-
-                # If the token has leading whitespace, it terminates the current name.
-                # If it terminates the name, the base_name must ALREADY be complete and valid.
-                if self.token_table.has_ws[i] or not self.token_table.ident[i]:
-                    if base_name in dom:
-                        out.append(i)
-                    continue
-                
-                # If it's a pure identifier continuation, check if it forms a valid prefix
-                new_name = base_name + self.token_table.ident[i]
-                
-                # If the token has "rest" characters (like punctuation), the name ends here.
-                # It must be an exact match in the domain.
-                if self.token_table.rest[i]:
-                    if new_name in dom:
-                        out.append(i)
-                # Otherwise, it's just an incomplete prefix.
-                else:
-                    if any(c.startswith(new_name) for c in dom):
-                        out.append(i)
-            else:
-                # If no pending name, fall back to checking if the token introduces a new site
-                if self.c.check(text + self.pieces[i]):
+                elif self.c.check(text + self.pieces[i]):
                     out.append(i)
         return out
 
