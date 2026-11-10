@@ -29,6 +29,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from token_table import TokenTable
+
 IDENT = r"[A-Za-z_$][\w$]*"
 _IDENT_CHAR = re.compile(r"[\w$]")
 
@@ -327,6 +329,7 @@ class RowFilter:
         self.fallbacks = 0               # steps where nothing survived
         self.checked = 0                 # candidate tokens examined
         self.seconds = 0.0               # time spent inside allowed()
+        self.token_table = TokenTable(pieces)
 
     def text_of(self, gen_ids):
         return "".join(self.pieces[i] or "" for i in gen_ids)
@@ -346,30 +349,43 @@ class RowFilter:
 
         out = []
         for i in cand_ids:
-            piece = self.pieces[i]
-
-            if i in self.stop_ids:
-                ok = self.c.check(text, final=True)
-            elif piece is None:
-                ok = True                # other special tokens: fail open
-            else:
-                # If we have an incomplete site, just check if the piece forms a valid prefix
-                if pending_site:
-                    kind, recv, base_name = pending_site
-                    dom = self.c._domain(kind, recv)
-                    
-                    if dom is None:
-                        ok = True        # unresolved site: fail open
-                    else:
-                        new_name = base_name + piece
-                        ok = any(c.startswith(new_name) for c in dom)
+            if self.token_table.is_special[i]:
+                if i in self.stop_ids:
+                    ok = self.c.check(text, final=True)
                 else:
-                    # If no pending name, fall back to checking if the token introduces a new site
-                    ok = self.c.check(text + piece)
-            if ok:
-                out.append(i)
-        self.checked += len(cand_ids)
-        self.seconds += time.perf_counter() - t0
+                    out.append(i) # Fail open for other specials
+                continue               # other special tokens: fail open
+            if pending_site:
+                kind, recv, base_name = pending_site
+                dom = self.c._domain(kind, recv)
+                
+                if dom is None:
+                    out.append(i)
+                    continue
+
+                # If the token has leading whitespace, it terminates the current name.
+                # If it terminates the name, the base_name must ALREADY be complete and valid.
+                if self.token_table.has_ws[i] or not self.token_table.ident[i]:
+                    if base_name in dom:
+                        out.append(i)
+                    continue
+                
+                # If it's a pure identifier continuation, check if it forms a valid prefix
+                new_name = base_name + self.token_table.ident[i]
+                
+                # If the token has "rest" characters (like punctuation), the name ends here.
+                # It must be an exact match in the domain.
+                if self.token_table.rest[i]:
+                    if new_name in dom:
+                        out.append(i)
+                # Otherwise, it's just an incomplete prefix.
+                else:
+                    if any(c.startswith(new_name) for c in dom):
+                        out.append(i)
+            else:
+                # If no pending name, fall back to checking if the token introduces a new site
+                if self.c.check(text + self.pieces[i]):
+                    out.append(i)
         return out
 
 
