@@ -2,6 +2,7 @@ import re
 
 _WS = re.compile(r"^\s*")
 _ID = re.compile(r"^[A-Za-z_$][\w$]*")
+_SINGLE_DOT = re.compile(r"^\.([A-Za-z_$][\w$]*)$")
 
 class TokenTable:
     def __init__(self, pieces):
@@ -10,6 +11,8 @@ class TokenTable:
         self.ident = []
         self.rest = []
         self.is_special = []
+        self.is_single_dot = []
+        self.post_dot_ident = []
 
         for p in pieces:
             if p is None:
@@ -36,3 +39,10 @@ class TokenTable:
             self.ident.append(ident)
             self.rest.append(rest)
             self.is_special.append(False)
+            dot_match = _SINGLE_DOT.match(p_no_ws) if p_no_ws else None
+            if dot_match:
+                self.is_single_dot.append(True)
+                self.post_dot_ident.append(dot_match.group(1))
+            else:
+                self.is_single_dot.append(False)
+                self.post_dot_ident.append("")

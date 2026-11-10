@@ -360,27 +360,48 @@ class RowFilter:
                 pending_site = (kind, recv, name)
                 break  # This is the incomplete name we are currently typing
 
+        completed_receiver = None
+        if not pending_site and sites:
+            # Check if the very last extracted site is a completed receiver waiting for a dot
+            last_site = sites[-1]
+            if last_site[3]: # complete is True
+                completed_receiver = last_site[1] # e.g., "Math"
+
         out = []
         cand_array = np.array(cand_ids, dtype=np.int64)
         if pending_site:
+            # Path 1: We are in the middle of typing an identifier (e.g., "Math.ma")
             kind, recv, base_name = pending_site
-            
-            # Get the vectorized boolean mask for the entire vocabulary
             valid_mask = self.walker.get_mask(recv, base_name)
-            
-            # Filter the candidates using NumPy
-            # We also fail-open for special tokens (like EOS) if they are in cand_ids
             is_valid_cand = valid_mask[cand_array] | self.walker.is_special[cand_array]
-            
-            # Extract the actual token IDs that passed the check
             out = cand_array[is_valid_cand].tolist()
             
-        else:
-            # Fallback for complex tokens or new sites
-            for i in cand_ids:
-                if self.walker.is_special[i]:
+            # Note: Single-dot tokens are naturally rejected here because they contain 
+            # punctuation, which fails the structural rules in `get_mask`.
+        elif completed_receiver:
+            # Path 2: We have a receiver and are waiting for a dot (e.g., "Math")
+            # We execute the SECOND trie walk specifically for single-dot tokens
+            
+            # The base_name is empty because the dot token provides the start of the word
+            dot_mask = self.dot_walker.get_mask(completed_receiver, base_name="")
+            
+            # A candidate is valid if it's a valid single-dot token, OR we fallback to CPU
+            # for normal text continuations (like a space or semicolon).
+            is_valid_dot = dot_mask[cand_array] & self.token_table.is_single_dot[cand_array]
+            
+            # Process the fast-path dot tokens
+            fast_out = cand_array[is_valid_dot].tolist()
+            out.extend(fast_out)
+            
+            # CPU Fallback for the rest of the tokens (spaces, operators, complex tokens)
+            slow_cands = cand_array[~is_valid_dot].tolist()
+            for i in slow_cands:
+                if self.walker.is_special[i] or self.c.check(text + self.pieces[i]):
                     out.append(i)
-                elif self.c.check(text + self.pieces[i]):
+        else:
+            # Path 3: Standard CPU fallback for entirely unknown states
+            for i in cand_ids:
+                if self.walker.is_special[i] or self.c.check(text + self.pieces[i]):
                     out.append(i)
         return out
 
