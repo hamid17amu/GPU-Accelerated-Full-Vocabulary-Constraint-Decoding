@@ -29,11 +29,6 @@ import re
 import subprocess
 from pathlib import Path
 
-import numpy as np
-
-from token_table import TokenTable
-from vectorizedTrieWalker import VectorizedTrieWalker
-
 IDENT = r"[A-Za-z_$][\w$]*"
 _IDENT_CHAR = re.compile(r"[\w$]")
 
@@ -332,146 +327,140 @@ class RowFilter:
         self.fallbacks = 0               # steps where nothing survived
         self.checked = 0                 # candidate tokens examined
         self.seconds = 0.0               # time spent inside allowed()
-        self.token_table = TokenTable(pieces)
-
-        # Extract all known domains from the constraints (e.g., {"Math": ["max", "min"...]})
-        # and initialize the vectorized walker once.
-        self.walker = VectorizedTrieWalker(
-            domains=self.c.get_all_domains(), 
-            vocab_identifiers=self.token_table.ident
-        )
-        
-        # Pass the structural flags to the walker for fast masking
-        self.walker.has_ws = np.array(self.token_table.has_ws, dtype=bool)
-        self.walker.has_rest = np.array([bool(r) for r in self.token_table.rest], dtype=bool)
-        self.walker.is_special = np.array(self.token_table.is_special, dtype=bool)
 
     def text_of(self, gen_ids):
         return "".join(self.pieces[i] or "" for i in gen_ids)
 
     def allowed(self, gen_ids, cand_ids):
+        import time
+        t0 = time.perf_counter()
         text = self.text_of(gen_ids)
-
-        # Scan the text to find the current grammatical state
-        sites = extract_sites(text, final=False)
-        pending_site = None
-        for kind, recv, name, complete in sites:
-            if not complete:
-                pending_site = (kind, recv, name)
-                break  # This is the incomplete name we are currently typing
-
-        completed_receiver = None
-        if not pending_site and sites:
-            # Check if the very last extracted site is a completed receiver waiting for a dot
-            last_site = sites[-1]
-            if last_site[3]: # complete is True
-                completed_receiver = last_site[1] # e.g., "Math"
-
         out = []
-        cand_array = np.array(cand_ids, dtype=np.int64)
-        if pending_site:
-            # Path 1: We are in the middle of typing an identifier (e.g., "Math.ma")
-            kind, recv, base_name = pending_site
-            valid_mask = self.walker.get_mask(recv, base_name)
-            is_valid_cand = valid_mask[cand_array] | self.walker.is_special[cand_array]
-            out = cand_array[is_valid_cand].tolist()
-            
-            # Note: Single-dot tokens are naturally rejected here because they contain 
-            # punctuation, which fails the structural rules in `get_mask`.
-        elif completed_receiver:
-            # Path 2: We have a receiver and are waiting for a dot (e.g., "Math")
-            # We execute the SECOND trie walk specifically for single-dot tokens
-            
-            # The base_name is empty because the dot token provides the start of the word
-            dot_mask = self.dot_walker.get_mask(completed_receiver, base_name="")
-            
-            # A candidate is valid if it's a valid single-dot token, OR we fallback to CPU
-            # for normal text continuations (like a space or semicolon).
-            is_valid_dot = dot_mask[cand_array] & self.token_table.is_single_dot[cand_array]
-            
-            # Process the fast-path dot tokens
-            fast_out = cand_array[is_valid_dot].tolist()
-            out.extend(fast_out)
-            
-            # CPU Fallback for the rest of the tokens (spaces, operators, complex tokens)
-            slow_cands = cand_array[~is_valid_dot].tolist()
-            for i in slow_cands:
-                if self.walker.is_special[i] or self.c.check(text + self.pieces[i]):
-                    out.append(i)
-        else:
-            # Path 3: Standard CPU fallback for entirely unknown states
-            for i in cand_ids:
-                if self.walker.is_special[i] or self.c.check(text + self.pieces[i]):
-                    out.append(i)
+        for i in cand_ids:
+            if i in self.stop_ids:
+                ok = self.c.check(text, final=True)
+            elif self.pieces[i] is None:
+                ok = True                # other special tokens: fail open
+            else:
+                ok = self.c.check(text + self.pieces[i])
+            if ok:
+                out.append(i)
+        self.checked += len(cand_ids)
+        self.seconds += time.perf_counter() - t0
         return out
 
 
-def make_logits_processor(tokenizer, constraints, stop_ids, top_k=64, wide_k=1024,
-                          min_allowed=20, pieces=None):
-    """HF LogitsProcessor implementing LAZY WIDENING (the project's baseline).
+def make_logits_processor(tokenizer, constraints, stop_ids, top_k=64, wide_k=1024, min_allowed=20, pieces=None):
+    import torch
+    from transformers import LogitsProcessor
+    import cuda_constraints
 
-    Per row (= per beam) and per step:
+    pieces = pieces or build_piece_table(tokenizer)
+    core = RowFilter(pieces, constraints, stop_ids)
+    
+    vocab_size = len(pieces)
+    vocab_chars = bytearray()
+    vocab_offsets = [0]
+    is_special = []
+    is_stop = []
+    
+    for i, p in enumerate(pieces):
+        is_special.append(p is None)
+        is_stop.append(i in stop_ids)
+        vocab_chars.extend((p or "").encode('utf-8'))
+        vocab_offsets.append(len(vocab_chars))
+        
+    def flatten_set(string_set):
+        chars = bytearray()
+        offsets = [0]
+        for s in string_set:
+            chars.extend(s.encode('utf-8'))
+            offsets.append(len(chars))
+        return offsets, bytes(chars), len(string_set)
 
-        1. take the Top-`top_k` tokens by score and check them;
-        2. if fewer than `min_allowed` survive, retake the Top-`wide_k` and
-           check those instead;
-        3. if still nothing survives, fail open and return the row unchanged.
+    # Flatten Receivers, Types, and Cases
+    rule_recv_chars, rule_mem_chars = bytearray(), bytearray()
+    rule_recv_offsets, rule_mem_offsets = [0], [0]
+    num_recv = 0
+    type_offsets, type_chars, num_types = [0], bytes(), 0
+    case_offsets, case_chars, num_cases = [0], bytes(), 0
 
-    Set `min_allowed >= 2 * num_beams`, or beam search runs out of beams.
+    if constraints and constraints.use_static and constraints.sym.ok:
+        for recv, members in constraints.sym.receivers.items():
+            recv_bytes = recv.encode('utf-8')
+            for mem in members:
+                rule_recv_chars.extend(recv_bytes)
+                rule_recv_offsets.append(len(rule_recv_chars))
+                rule_mem_chars.extend(recv_bytes + b'\0' + mem.encode('utf-8'))   # kernel needs receiver+member
+                rule_mem_offsets.append(len(rule_mem_chars))
+                num_recv += 1
+                
+        if constraints.sym.new_enabled and constraints.sym.types:
+            type_offsets, type_chars, num_types = flatten_set(constraints.sym.types)
+        if constraints.sym.case_constants:
+            case_offsets, case_chars, num_cases = flatten_set(constraints.sym.case_constants)
 
-    Known limitation (section 1 of the handout): a valid token ranked below
-    `wide_k` can never be recovered, no matter how many times we widen. The
-    fix is to check the whole vocabulary -- which is what tasks 2-4 are about.
-    Replace the body of the per-row loop below with your full-vocabulary CPU
-    and CUDA versions and keep this one as the baseline to compare against.
-    """
+    checker = cuda_constraints.VocabChecker(
+        vocab_offsets, bytes(vocab_chars), vocab_size, is_special, is_stop,
+        rule_recv_offsets, bytes(rule_recv_chars), rule_mem_offsets, bytes(rule_mem_chars), num_recv,
+        type_offsets, type_chars, num_types,
+        case_offsets, case_chars, num_cases
+    )
+
+    import time
     import torch
     from transformers import LogitsProcessor
 
-    core = RowFilter(pieces or build_piece_table(tokenizer), constraints, stop_ids)
 
-    class LazyWideningLogitsProcessor(LogitsProcessor):
+    _DTYPE_CODES = {
+        torch.float32: 0,
+        torch.float16: 1,
+        torch.bfloat16: 2,
+    }
+
+
+    class FullDecodingLogitsProcessor(LogitsProcessor):
         def __init__(self):
-            self.prompt_len = None
-            self.core = core
+            self.prompt_len = 0
             self.steps = 0
             self.widenings = 0
+            self.fallbacks = 0
+            self.tokens_checked = 0
+            self.check_time_s = 0.0
 
-        def set_prompt_len(self, n):
-            """Where the completion starts, so `gen_ids` excludes the prompt."""
-            self.prompt_len = n
+        def set_prompt_len(self, prompt_len: int) -> None:
+            self.prompt_len = prompt_len
 
-        def __call__(self, input_ids, scores):
-            if self.prompt_len is None:
-                raise RuntimeError("call set_prompt_len() before generate()")
+        def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+            t0 = time.perf_counter()
+
+            gen_ids = input_ids[:, self.prompt_len:]
+            batch_texts = [core.text_of(row) for row in gen_ids.tolist()]
+
+            num_beams, vocab_dim = scores.shape
+            stream_ptr = torch.cuda.current_stream(scores.device).cuda_stream
+
+            checker.mask_scores_ptr(
+                batch_texts,
+                scores.data_ptr(),
+                num_beams,
+                vocab_dim,
+                scores.stride(0),
+                _DTYPE_CODES[scores.dtype],
+                stream_ptr,
+            )
+            assert scores.stride(1) == 1
+
+            # a beam with no legal token is left untouched by the kernel (fail open)
+
             self.steps += 1
-            out = torch.full_like(scores, float("-inf"))
-            vocab = scores.shape[1]
-            for row in range(scores.shape[0]):
-                gen = input_ids[row, self.prompt_len:].tolist()
-                allowed = []
-                for stage, k in enumerate((top_k, wide_k)):
-                    ids = torch.topk(scores[row], min(k, vocab)).indices.tolist()
-                    allowed = core.allowed(gen, ids)
-                    if len(allowed) >= min_allowed:
-                        break
-                    if stage == 0:
-                        self.widenings += 1
-                if not allowed:
-                    core.fallbacks += 1
-                    out[row] = scores[row]
-                    continue
-                out[row, allowed] = scores[row, allowed]
-            return out
-
+            self.tokens_checked += num_beams * vocab_dim
+            self.check_time_s += time.perf_counter() - t0
+            return scores
+            
         def stats(self):
             return {
-                "steps": self.steps,
-                "widenings": self.widenings,
-                "fallbacks": core.fallbacks,
-                "tokens_checked": core.checked,
-                "check_seconds": round(core.seconds, 3),
-                "constraint_calls": constraints.n_checks,
+                "steps": self.steps, "widenings": 0, "fallbacks": self.fallbacks,
+                "tokens_checked": self.tokens_checked, "check_seconds": round(self.check_time_s, 3)
             }
-
-    return LazyWideningLogitsProcessor()
+    return FullDecodingLogitsProcessor()
